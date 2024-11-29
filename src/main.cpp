@@ -1,237 +1,52 @@
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/i2c.h"
-#include "driver/gpio.h"
 #include "esp_log.h"
-#include <cstring>  // Für strlen()
+#include "driver/gpio.h"
+#include "esp_adc/adc_oneshot.h"
 
-#define I2C_MASTER_SCL_IO           22      // GPIO für SCL
-#define I2C_MASTER_SDA_IO           21      // GPIO für SDA
-#define I2C_MASTER_NUM              I2C_NUM_0  // I2C master Nummer (geändert zu enum)
-#define I2C_MASTER_FREQ_HZ          400000  // I2C Frequenz
-#define OLED_ADDR                   0x3C    // Display Adresse
+static const char* TAG = "ADC_TEST";
 
-static const char *TAG = "OLED_EXAMPLE";
+// ADC Konfiguration
+#define ADC_CHANNEL     ADC_CHANNEL_0  // GPIO 36 (VP)
+#define DC_OFFSET       1890           // Gemessener Ruhewert
+#define THRESHOLD       100            // Schwelle für Signalerkennung
 
-// I2C Initialisierung
-static esp_err_t i2c_master_init(void)
-{
-    i2c_config_t conf = {};  // Zuerst leere Initialisierung
-    conf.mode = I2C_MODE_MASTER;
-    conf.sda_io_num = I2C_MASTER_SDA_IO;
-    conf.scl_io_num = I2C_MASTER_SCL_IO;
-    conf.sda_pullup_en = GPIO_PULLUP_ENABLE;
-    conf.scl_pullup_en = GPIO_PULLUP_ENABLE;
-    conf.master.clk_speed = I2C_MASTER_FREQ_HZ;
-    
-    esp_err_t err = i2c_param_config(I2C_MASTER_NUM, &conf);
-    if (err != ESP_OK) return err;
-    
-    return i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
-}
-
-// OLED Display Initialisierung
-static void oled_init() {
-    uint8_t init_cmd[] = {
-        0x00,   // Command mode
-        0xAE,   // Display off
-        0xD5, 0x80,   // Set display clock
-        0xA8, 0x3F,   // Set multiplex
-        0xD3, 0x00,   // Set display offset
-        0x40,   // Start line
-        0x8D, 0x14,   // Charge pump
-        0x20, 0x00,   // Memory mode
-        0xA1,   // Segment remap
-        0xC8,   // COM scan direction
-        0xDA, 0x12,   // COM pins
-        0x81, 0xCF,   // Contrast
-        0xD9, 0xF1,   // Pre-charge
-        0xDB, 0x40,   // VCOMH
-        0xA4,   // Display RAM
-        0xA6,   // Normal display
-        0xAF    // Display on
+extern "C" void app_main(void) {
+    // ADC Initialisierung
+    adc_oneshot_unit_init_cfg_t init_config = {
+        ADC_UNIT_1,               // unit_id
+        ADC_RTC_CLK_SRC_DEFAULT,  // clk_src
+        ADC_ULP_MODE_DISABLE      // ulp_mode
     };
     
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (OLED_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write(cmd, init_cmd, sizeof(init_cmd), true);
-    i2c_master_stop(cmd);
-    ESP_ERROR_CHECK(i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000)));
-    i2c_cmd_link_delete(cmd);
-}
-
-// Display löschen
-static void clear_display() {
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (OLED_ADDR << 1) | I2C_MASTER_WRITE, true);
+    adc_oneshot_chan_cfg_t config = {
+        ADC_ATTEN_DB_12,         // atten
+        ADC_BITWIDTH_DEFAULT     // bitwidth
+    };
     
-    // Set column address (0-127)
-    i2c_master_write_byte(cmd, 0x00, true); // command mode
-    i2c_master_write_byte(cmd, 0x21, true); // set column addr
-    i2c_master_write_byte(cmd, 0, true);    // start at 0
-    i2c_master_write_byte(cmd, 127, true);  // end at 127
+    adc_oneshot_unit_handle_t adc1_handle;
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &adc1_handle));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL, &config));
     
-    // Set page address (0-7)
-    i2c_master_write_byte(cmd, 0x22, true); // set page addr
-    i2c_master_write_byte(cmd, 0, true);    // start at 0
-    i2c_master_write_byte(cmd, 7, true);    // end at 7
-    
-    i2c_master_stop(cmd);
-    ESP_ERROR_CHECK(i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000)));
-    i2c_cmd_link_delete(cmd);
-    
-    // Fill with zeros
-    cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (OLED_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, 0x40, true); // data mode
-    
-    // Fill all pages with zeros
-    for (int i = 0; i < 1024; i++) {  // 128 columns * 8 pages
-        i2c_master_write_byte(cmd, 0x00, true);
-    }
-    
-    i2c_master_stop(cmd);
-    ESP_ERROR_CHECK(i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000)));
-    i2c_cmd_link_delete(cmd);
-}
-
-// Einfache 8x8 Font-Definition (nur Großbuchstaben und einige Sonderzeichen)
-static const uint8_t font8x8[] = {
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,   // Space
-    0x00, 0x00, 0x00, 0x00, 0x5F, 0x00, 0x00, 0x00,   // !
-    0x00, 0x00, 0x00, 0x07, 0x00, 0x07, 0x00, 0x00,   // "
-    0x00, 0x14, 0x7F, 0x14, 0x7F, 0x14, 0x00, 0x00,   // #
-    0x00, 0x24, 0x2A, 0x7F, 0x2A, 0x12, 0x00, 0x00,   // $
-    0x00, 0x23, 0x13, 0x08, 0x64, 0x62, 0x00, 0x00,   // %
-    0x00, 0x36, 0x49, 0x55, 0x22, 0x50, 0x00, 0x00,   // &
-    0x00, 0x00, 0x05, 0x03, 0x00, 0x00, 0x00, 0x00,   // '
-    0x00, 0x1C, 0x22, 0x41, 0x00, 0x00, 0x00, 0x00,   // (
-    0x00, 0x41, 0x22, 0x1C, 0x00, 0x00, 0x00, 0x00,   // )
-    0x00, 0x08, 0x2A, 0x1C, 0x2A, 0x08, 0x00, 0x00,   // *
-    0x00, 0x08, 0x08, 0x3E, 0x08, 0x08, 0x00, 0x00,   // +
-    0x00, 0xA0, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00,   // ,
-    0x00, 0x08, 0x08, 0x08, 0x08, 0x08, 0x00, 0x00,   // -
-    0x00, 0x60, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00,   // .
-    0x00, 0x20, 0x10, 0x08, 0x04, 0x02, 0x00, 0x00,   // /
-    0x00, 0x3E, 0x51, 0x49, 0x45, 0x3E, 0x00, 0x00,   // 0
-    0x00, 0x00, 0x42, 0x7F, 0x40, 0x00, 0x00, 0x00,   // 1
-    0x00, 0x62, 0x51, 0x49, 0x49, 0x46, 0x00, 0x00,   // 2
-    0x00, 0x22, 0x41, 0x49, 0x49, 0x36, 0x00, 0x00,   // 3
-    0x00, 0x18, 0x14, 0x12, 0x7F, 0x10, 0x00, 0x00,   // 4
-    0x00, 0x27, 0x45, 0x45, 0x45, 0x39, 0x00, 0x00,   // 5
-    0x00, 0x3C, 0x4A, 0x49, 0x49, 0x30, 0x00, 0x00,   // 6
-    0x00, 0x01, 0x71, 0x09, 0x05, 0x03, 0x00, 0x00,   // 7
-    0x00, 0x36, 0x49, 0x49, 0x49, 0x36, 0x00, 0x00,   // 8
-    0x00, 0x06, 0x49, 0x49, 0x29, 0x1E, 0x00, 0x00,   // 9
-    0x00, 0x00, 0x36, 0x36, 0x00, 0x00, 0x00, 0x00,   // :
-    0x00, 0x00, 0xAC, 0x6C, 0x00, 0x00, 0x00, 0x00,   // ;
-    0x00, 0x08, 0x14, 0x22, 0x41, 0x00, 0x00, 0x00,   // <
-    0x00, 0x14, 0x14, 0x14, 0x14, 0x14, 0x00, 0x00,   // =
-    0x00, 0x41, 0x22, 0x14, 0x08, 0x00, 0x00, 0x00,   // >
-    0x00, 0x02, 0x01, 0x51, 0x09, 0x06, 0x00, 0x00,   // ?
-    0x00, 0x32, 0x49, 0x79, 0x41, 0x3E, 0x00, 0x00,   // @
-    0x00, 0x7E, 0x09, 0x09, 0x09, 0x7E, 0x00, 0x00,   // A
-    0x00, 0x7F, 0x49, 0x49, 0x49, 0x36, 0x00, 0x00,   // B
-    0x00, 0x3E, 0x41, 0x41, 0x41, 0x22, 0x00, 0x00,   // C
-    0x00, 0x7F, 0x41, 0x41, 0x22, 0x1C, 0x00, 0x00,   // D
-    0x00, 0x7F, 0x49, 0x49, 0x49, 0x41, 0x00, 0x00,   // E
-    0x00, 0x7F, 0x09, 0x09, 0x09, 0x01, 0x00, 0x00,   // F
-    0x00, 0x3E, 0x41, 0x41, 0x51, 0x72, 0x00, 0x00,   // G
-    0x00, 0x7F, 0x08, 0x08, 0x08, 0x7F, 0x00, 0x00,   // H
-    0x00, 0x41, 0x7F, 0x41, 0x00, 0x00, 0x00, 0x00,   // I
-    0x00, 0x20, 0x40, 0x41, 0x3F, 0x01, 0x00, 0x00,   // J
-    0x00, 0x7F, 0x08, 0x14, 0x22, 0x41, 0x00, 0x00,   // K
-    0x00, 0x7F, 0x40, 0x40, 0x40, 0x40, 0x00, 0x00,   // L
-    0x00, 0x7F, 0x02, 0x0C, 0x02, 0x7F, 0x00, 0x00,   // M
-    0x00, 0x7F, 0x04, 0x08, 0x10, 0x7F, 0x00, 0x00,   // N
-    0x00, 0x3E, 0x41, 0x41, 0x41, 0x3E, 0x00, 0x00,   // O
-    0x00, 0x7F, 0x09, 0x09, 0x09, 0x06, 0x00, 0x00,   // P
-    0x00, 0x3E, 0x41, 0x51, 0x21, 0x5E, 0x00, 0x00,   // Q
-    0x00, 0x7F, 0x09, 0x19, 0x29, 0x46, 0x00, 0x00,   // R
-    0x00, 0x26, 0x49, 0x49, 0x49, 0x32, 0x00, 0x00,   // S
-    0x00, 0x01, 0x01, 0x7F, 0x01, 0x01, 0x00, 0x00,   // T
-    0x00, 0x3F, 0x40, 0x40, 0x40, 0x3F, 0x00, 0x00,   // U
-    0x00, 0x1F, 0x20, 0x40, 0x20, 0x1F, 0x00, 0x00,   // V
-    0x00, 0x3F, 0x40, 0x38, 0x40, 0x3F, 0x00, 0x00,   // W
-    0x00, 0x63, 0x14, 0x08, 0x14, 0x63, 0x00, 0x00,   // X
-    0x00, 0x03, 0x04, 0x78, 0x04, 0x03, 0x00, 0x00,   // Y
-    0x00, 0x61, 0x51, 0x49, 0x45, 0x43, 0x00, 0x00,   // Z
-};
-
-// Text auf Display schreiben
-static void display_text(const char* text) {
-    // Display zuerst löschen
-    clear_display();
-    
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (OLED_ADDR << 1) | I2C_MASTER_WRITE, true);
-    
-    // Set column address (0-127)
-    i2c_master_write_byte(cmd, 0x00, true); // command mode
-    i2c_master_write_byte(cmd, 0x21, true); // set column addr
-    i2c_master_write_byte(cmd, 0, true);    // start
-    i2c_master_write_byte(cmd, 127, true);  // end
-    
-    // Set page address (0-7)
-    i2c_master_write_byte(cmd, 0x22, true); // set page addr
-    i2c_master_write_byte(cmd, 2, true);    // start
-    i2c_master_write_byte(cmd, 3, true);    // end
-    
-    // Ensure normal display mode (not inverted)
-    i2c_master_write_byte(cmd, 0xA6, true); // Normal display (0xA7 would be inverted)
-    
-    i2c_master_stop(cmd);
-    ESP_ERROR_CHECK(i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000)));
-    i2c_cmd_link_delete(cmd);
-    
-    // Write data
-    cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (OLED_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, 0x40, true); // data mode
-    
-    // Write each character
-    for (size_t i = 0; i < strlen(text); i++) {
-        char c = text[i];
-        // Nur Großbuchstaben und einige Sonderzeichen
-        if (c >= ' ' && c <= 'Z') {
-            const uint8_t* char_data = &font8x8[(c - ' ') * 8];
-            for (int j = 0; j < 8; j++) {
-                i2c_master_write_byte(cmd, char_data[j], true);
-            }
-        }
-    }
-    
-    i2c_master_stop(cmd);
-    ESP_ERROR_CHECK(i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000)));
-    i2c_cmd_link_delete(cmd);
-}
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-void app_main(void)
-{
-    ESP_LOGI(TAG, "Initializing I2C");
-    ESP_ERROR_CHECK(i2c_master_init());
-    
-    ESP_LOGI(TAG, "Initializing OLED");
-    oled_init();
-    
-    ESP_LOGI(TAG, "Writing text");
-    display_text("HALLO!");
+    bool last_state = false;
     
     while(1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        int adc_raw;
+        ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, ADC_CHANNEL, &adc_raw));
+        
+        // Prüfe ob Signal vom DC-Offset abweicht
+        bool signal_present = (abs(adc_raw - DC_OFFSET) > THRESHOLD);
+        
+        // Nur ausgeben wenn sich der Zustand ändert
+        if (signal_present != last_state) {
+            ESP_LOGI(TAG, "%s (ADC: %d, Diff: %d)", 
+                    signal_present ? "SIGNAL" : "NON", 
+                    adc_raw, 
+                    adc_raw - DC_OFFSET);
+            last_state = signal_present;
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(20));  // Schnelleres Sampling
     }
 }
-
-#ifdef __cplusplus
-}
-#endif
