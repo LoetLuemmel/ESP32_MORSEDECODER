@@ -1,194 +1,198 @@
-#include <esp_adc/adc_continuous.h>
-#include <driver/gpio.h>
-#include <esp_timer.h>
-#include <esp_log.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
-#include "esp_pm.h"
-#include "esp_system.h"
+#include <stdio.h>
+#include <cstring>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "driver/i2c.h"
+#include "esp_log.h"
+#include "font8x8.h"
 #include "morse_code.h"
 
-#define SAMPLE_BUFFER_SIZE 256
+static const char* TAG = "TEST";
 
-// Morse timing constants (in milliseconds)
-#define DIT_LENGTH      100     // Base unit length
-#define DAH_LENGTH      300     // 3x DIT length
-#define CHAR_SPACE      300     // Space between characters (3x DIT)
-#define WORD_SPACE      700     // Space between words (7x DIT)
-#define TIMING_TOLERANCE 0.2    // 20% timing tolerance
+// I2C Definitionen
+#define I2C_MASTER_SCL_IO           22      // GPIO für I2C SCL
+#define I2C_MASTER_SDA_IO           21      // GPIO für I2C SDA
+#define I2C_MASTER_NUM              I2C_NUM_0
+#define I2C_MASTER_FREQ_HZ          400000
+#define OLED_ADDR                   0x3C
 
-// ADC and signal detection constants
-#define SIGNAL_THRESHOLD    800  // ADC threshold (0-4095)
-#define NOISE_THRESHOLD    150   // Noise floor
-#define MIN_SAMPLES_FOR_SIGNAL 5 // Minimum samples above threshold to detect signal
-
-// Timing-Konstanten (in Millisekunden)
-#define DOT_DURATION 100     // Typische Länge eines DIT
-#define DASH_DURATION 300    // Typische Länge eines DASH
-#define SYMBOL_GAP 100      // Pause zwischen Symbolen
-#define LETTER_GAP 300      // Pause zwischen Buchstaben
-#define WORD_GAP 700        // Pause zwischen Wörtern
-
-static TaskHandle_t s_task_handle;
-static adc_continuous_handle_t adc_handle = NULL;
-
-static bool IRAM_ATTR s_conversion_done_cb(adc_continuous_handle_t handle, 
-                                         const adc_continuous_evt_data_t *edata, 
-                                         void *user_data) {
-    BaseType_t mustYield = pdFALSE;
-    vTaskNotifyGiveFromISR(s_task_handle, &mustYield);
-    return (mustYield == pdTRUE);
+// I2C Initialisierung
+static esp_err_t i2c_master_init(void) {
+    i2c_port_t i2c_master_port = I2C_MASTER_NUM;
+    i2c_config_t conf = {};
+    conf.mode = I2C_MODE_MASTER;
+    conf.sda_io_num = I2C_MASTER_SDA_IO;
+    conf.scl_io_num = I2C_MASTER_SCL_IO;
+    conf.sda_pullup_en = GPIO_PULLUP_ENABLE;
+    conf.scl_pullup_en = GPIO_PULLUP_ENABLE;
+    conf.master.clk_speed = 100000; // Standard 100KHz I2C Frequenz
+    
+    esp_err_t err = i2c_param_config(i2c_master_port, &conf);
+    if (err != ESP_OK) return err;
+    
+    return i2c_driver_install(i2c_master_port, conf.mode, 0, 0, 0);
 }
 
-static const char* TAG = "MORSE";
-
-void morse_decoder_task(void* arg) {
-    adc_continuous_handle_t adc_handle = (adc_continuous_handle_t)arg;
+// OLED Display Initialisierung (Ihre funktionierende Version)
+static void oled_init() {
+    uint8_t init_cmd[] = {
+        0x00,   // Command mode
+        0xAE,   // Display off
+        0xD5, 0x80,   // Set display clock
+        0xA8, 0x3F,   // Set multiplex
+        0xD3, 0x00,   // Set display offset
+        0x40,   // Start line
+        0x8D, 0x14,   // Charge pump
+        0x20, 0x00,   // Memory mode
+        0xA1,   // Segment remap
+        0xC8,   // COM scan direction
+        0xDA, 0x12,   // COM pins
+        0x81, 0xCF,   // Contrast
+        0xD9, 0xF1,   // Pre-charge
+        0xDB, 0x40,   // VCOMH
+        0xA4,   // Display RAM
+        0xA6,   // Normal display
+        0xAF    // Display on
+    };
     
-    uint8_t* buffer = (uint8_t*)heap_caps_malloc(SAMPLE_BUFFER_SIZE * sizeof(uint16_t), MALLOC_CAP_DMA);
-    if (buffer == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate memory for ADC buffer");
-        vTaskDelete(NULL);
-        return;
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (OLED_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write(cmd, init_cmd, sizeof(init_cmd), true);
+    i2c_master_stop(cmd);
+    ESP_ERROR_CHECK(i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000)));
+    i2c_cmd_link_delete(cmd);
+    ESP_LOGI(TAG, "OLED initialized");
+}
+
+// Display löschen mit längerem Timeout
+static void clear_display() {
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (OLED_ADDR << 1) | I2C_MASTER_WRITE, true);
+    
+    // Set column address (0-127)
+    i2c_master_write_byte(cmd, 0x00, true); // command mode
+    i2c_master_write_byte(cmd, 0x21, true); // set column addr
+    i2c_master_write_byte(cmd, 0, true);    // start at 0
+    i2c_master_write_byte(cmd, 127, true);  // end at 127
+    
+    // Set page address (0-7)
+    i2c_master_write_byte(cmd, 0x22, true); // set page addr
+    i2c_master_write_byte(cmd, 0, true);    // start at 0
+    i2c_master_write_byte(cmd, 7, true);    // end at 7
+    
+    i2c_master_stop(cmd);
+    ESP_ERROR_CHECK(i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000))); // Längerer Timeout
+    i2c_cmd_link_delete(cmd);
+    
+    // Kurze Pause
+    vTaskDelay(pdMS_TO_TICKS(10));
+    
+    // Fill with zeros
+    cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (OLED_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, 0x40, true); // data mode
+    
+    // Fill all pages with zeros
+    for (int i = 0; i < 1024; i++) {  // 128 columns * 8 pages
+        i2c_master_write_byte(cmd, 0x00, true);
     }
     
-    // Morse Dekodierung Variablen
-    char morse_buffer[MorseCode::MAX_MORSE_LENGTH] = {0};
-    int morse_pos = 0;
-    uint32_t signal_start = 0;
-    uint32_t signal_end = 0;
-    bool last_state = false;
-    uint32_t last_change = 0;
+    i2c_master_stop(cmd);
+    ESP_ERROR_CHECK(i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000))); // Längerer Timeout
+    i2c_cmd_link_delete(cmd);
+}
+
+// Vereinfachte Textausgabe mit rotierten Bytes
+static void display_text(const char* text) {
+    // Display zuerst löschen
+    clear_display();
     
-    while (true) {
-        uint32_t ret_num = 0;
-        esp_err_t ret = adc_continuous_read(adc_handle, buffer, 
-                                          SAMPLE_BUFFER_SIZE * sizeof(uint16_t),
-                                          &ret_num, 0);
-        
-        if (ret == ESP_OK) {
-            uint16_t* samples = (uint16_t*)buffer;
-            uint32_t num_samples = ret_num / sizeof(uint16_t);
-            
-            uint32_t sum = 0;
-            for(uint32_t i = 0; i < num_samples; i++) {
-                sum += samples[i] & 0x0FFF;
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (OLED_ADDR << 1) | I2C_MASTER_WRITE, true);
+    
+    // Set column address (0-127)
+    i2c_master_write_byte(cmd, 0x00, true); // command mode
+    i2c_master_write_byte(cmd, 0x21, true); // set column addr
+    i2c_master_write_byte(cmd, 0, true);    // start
+    i2c_master_write_byte(cmd, 127, true);  // end
+    
+    // Set page address (2-3) - mittlere Zeilen
+    i2c_master_write_byte(cmd, 0x22, true); // set page addr
+    i2c_master_write_byte(cmd, 2, true);    // start at page 2
+    i2c_master_write_byte(cmd, 3, true);    // end at page 3
+    
+    // Ensure normal display mode
+    i2c_master_write_byte(cmd, 0xA6, true); // Normal display
+    
+    i2c_master_stop(cmd);
+    ESP_ERROR_CHECK(i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000)));
+    i2c_cmd_link_delete(cmd);
+    
+    // Write data
+    cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (OLED_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, 0x40, true); // data mode
+    
+    // Write each character
+    for (size_t i = 0; i < strlen(text); i++) {
+        char c = text[i];
+        if (c >= ' ' && c <= 'Z') {  // Nur Großbuchstaben und Sonderzeichen
+            const uint8_t* char_data = &font8x8[(c - ' ') * 8];
+            for (int j = 0; j < 8; j++) {
+                i2c_master_write_byte(cmd, char_data[j], true);
             }
-            uint16_t avg = sum / num_samples;
-            
-            bool current_state = (avg > 150);
-            uint32_t current_time = esp_timer_get_time() / 1000; // Zeit in ms
-            
-            // Zustandsänderung erkennen
-            if (current_state != last_state) {
-                if (current_state) { // Signal geht auf HIGH
-                    signal_start = current_time;
-                } else { // Signal geht auf LOW
-                    signal_end = current_time;
-                    uint32_t duration = signal_end - signal_start;
-                    
-                    // DIT oder DASH erkennen
-                    if (duration >= DOT_DURATION/2) {
-                        if (duration < (DOT_DURATION + DASH_DURATION)/2) {
-                            morse_buffer[morse_pos++] = '.';
-                        } else {
-                            morse_buffer[morse_pos++] = '-';
-                        }
-                        morse_buffer[morse_pos] = '\0';
-                    }
-                }
-                last_change = current_time;
-            } else if (!current_state) { // Während LOW-Phase
-                uint32_t gap = current_time - last_change;
-                
-                // Buchstaben-Ende erkennen
-                if (gap > LETTER_GAP && morse_pos > 0) {
-                    MorseCode::decode(morse_buffer);
-                    morse_pos = 0;
-                    morse_buffer[0] = '\0';
-                }
-                // Wort-Ende erkennen (optional)
-                else if (gap > WORD_GAP) {
-                    // Nur wenn wir Wort-Trennung wollen:
-                    // ESP_LOGI(TAG, " ");
-                }
-            }
-            
-            last_state = current_state;
-            gpio_set_level(GPIO_NUM_17, current_state);
-            
-            if (morse_pos >= MorseCode::MAX_MORSE_LENGTH - 1) {
-                morse_pos = 0;
-                morse_buffer[0] = '\0';
-                ESP_LOGW(TAG, "Morse buffer overflow");
-            }
-            
-            vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
     
-    free(buffer);
+    i2c_master_stop(cmd);
+    ESP_ERROR_CHECK(i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000)));
+    i2c_cmd_link_delete(cmd);
 }
 
-extern "C" void app_main() {
-    ESP_LOGI(TAG, "Initializing Morse decoder...");
+extern "C" void app_main(void)
+{
+    ESP_LOGI(TAG, "Initializing I2C");
+    ESP_ERROR_CHECK(i2c_master_init());
     
-    // LED Setup (GPIO 17)
-    gpio_config_t led_gpio_config = {
-        .pin_bit_mask = (1ULL << GPIO_NUM_17),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE
+    ESP_LOGI(TAG, "Initializing OLED");
+    oled_init();
+    
+    // Start message
+    display_text("MORSE READY");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    
+    // Test der Morse-Code Dekodierung
+    const char* test_patterns[] = {
+        "...",   // S
+        "---",   // O
+        "...",   // S
     };
-    ESP_ERROR_CHECK(gpio_config(&led_gpio_config));
     
-    // Erste Konfiguration für den Handle
-    adc_continuous_handle_cfg_t handle_config = {
-        .max_store_buf_size = 1024,
-        .conv_frame_size = SAMPLE_BUFFER_SIZE,
-        .flags = {
-            .flush_pool = 0
+    char decoded_text[16] = "";  // Kleiner Buffer für den dekodierten Text
+    int pos = 0;
+    
+    // Dekodiere jeden Pattern
+    for(const char* pattern : test_patterns) {
+        char result = MorseCode::decode_to_char(pattern);
+        if(result != '\0' && pos < 14) {  // Sicherheitscheck für Buffer
+            decoded_text[pos++] = result;
+            decoded_text[pos] = '\0';
+            
+            // Zeige aktuellen Stand an
+            char display_buffer[16];  // Kleiner Buffer für die Anzeige
+            snprintf(display_buffer, sizeof(display_buffer), "%s", decoded_text);  // Nur Text ohne Prefix
+            display_text(display_buffer);
+            vTaskDelay(pdMS_TO_TICKS(1000));
         }
-    };
-    ESP_ERROR_CHECK(adc_continuous_new_handle(&handle_config, &adc_handle));
-
-    // ADC Pattern konfigurieren
-    adc_digi_pattern_config_t adc_pattern = {
-        .atten = ADC_ATTEN_DB_12,
-        .channel = ADC_CHANNEL_0,
-        .unit = ADC_UNIT_1,
-        .bit_width = ADC_BITWIDTH_12
-    };
-
-    // ADC Konfiguration
-    adc_continuous_config_t dig_cfg = {
-        .pattern_num = 1,
-        .adc_pattern = &adc_pattern,
-        .sample_freq_hz = 45000,
-        .conv_mode = ADC_CONV_SINGLE_UNIT_1,
-        .format = ADC_DIGI_OUTPUT_FORMAT_TYPE1,
-    };
-    ESP_ERROR_CHECK(adc_continuous_config(adc_handle, &dig_cfg));
-    
-    // ADC starten
-    ESP_ERROR_CHECK(adc_continuous_start(adc_handle));
-    
-    // Task erstellen
-    TaskHandle_t task_handle;
-    BaseType_t ret = xTaskCreate(
-        morse_decoder_task,
-        "morse_decoder",
-        8192,
-        (void*)adc_handle,
-        5,
-        &task_handle
-    );
-    
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create morse decoder task!");
-        return;
     }
     
-    ESP_LOGI(TAG, "Morse decoder initialized and running");
+    while(1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 }

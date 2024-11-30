@@ -92,4 +92,28 @@ namespace MorseCode {
         }
         ESP_LOGI(TAG, "Unknown symbol: %s", symbol);
     }
+
+    // Funktion zur Dekodierung eines Morse-Symbols zu einem Zeichen
+    inline char decode_to_char(const char* symbol) {
+        static const char* MORSE_TAG = "MORSE_DECODE";
+        
+        // Sicherheitscheck
+        if (!symbol || strlen(symbol) > MAX_MORSE_LENGTH) {
+            return '\0';
+        }
+        
+        // Durch die MORSE_TABLE iterieren
+        for(const auto& entry : MORSE_TABLE) {
+            if(entry.pattern && strcmp(symbol, entry.pattern) == 0) {
+                char result = entry.letter;
+                // Kleinbuchstaben in Großbuchstaben umwandeln
+                if (result >= 'a' && result <= 'z') {
+                    result = result - 'a' + 'A';
+                }
+                ESP_LOGI(MORSE_TAG, "Decoded: '%c' (%s)", result, symbol);
+                return result;
+            }
+        }
+        return '\0';
+    }
 } 
